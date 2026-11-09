@@ -1,244 +1,179 @@
+import os
 import time
-import datetime
+import threading
+import requests
 import ccxt
 import pandas as pd
-import threading
-import os
 from flask import Flask
 
 app = Flask(__name__)
 
-# خواندن امن کلیدها از متغیرهای محیطی هاست ابری (Render)
-API_KEY = os.getenv('TOOBIT_API_KEY')
-SECRET_KEY = os.getenv('TOOBIT_SECRET_KEY')
+# تنظیمات از متغیرهای محیطی Render
+API_KEY = os.environ.get("TOOBIT_API_KEY", "")
+SECRET_KEY = os.environ.get("TOOBIT_SECRET_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-exchange = ccxt.toobit({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'swap'}  # فیوچرز دائمی
-})
-
-TIMEFRAME = '1m'
+# تنظیمات ترید
 LEVERAGE = 15
-MAX_MARGIN = 0.5
-FEE_RATE = 0.0006
-MIN_NET_PROFIT = 0.01
+TARGET_MARGIN = 0.5  # مارجین هدف (دلار)
+TAKE_PROFIT_PCT = 0.10  # 10% سود
+STOP_LOSS_PCT = 0.05   # 5% ضرر
 
-positions = []  
-current_symbol = None
-blacklisted_symbols = [] 
-last_trade = {'symbol': None, 'side': None}
+
+def send_telegram(message):
+    """ارسال گزارش به تلگرام"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[Telegram Mock] {message}")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+
+
+def get_toobit_exchange():
+    exchange = ccxt.toobit({
+        'apiKey': API_KEY,
+        'secret': SECRET_KEY,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}  # فیوچرز
+    })
+    return exchange
+
+
+def run_bot_loop():
+    time.sleep(10)  # صبر برای بالا آمدن کامل سرور
+    send_telegram("🚀 ربات تریدر توبیت استارت شد و در حال اتصال به صرافی است...")
+
+    exchange = get_toobit_exchange()
+
+    try:
+        exchange.load_markets()
+        balance = exchange.fetch_balance()
+        usdt_free = balance['free'].get('USDT', 0)
+        send_telegram(f"✅ اتصال به توبیت برقرار شد!\nموجودی آزاد حساب: {usdt_free} USDT")
+    except Exception as e:
+        send_telegram(f"❌ خطا در اتصال به صرافی توبیت: {e}")
+        return
+
+    last_traded_symbol = None
+
+    while True:
+        try:
+            # بررسی پوزیشن‌های باز فعلی
+            positions = exchange.fetch_positions()
+            active_positions = [p for p in positions if float(p.get('contracts', 0) or 0) > 0]
+
+            if len(active_positions) > 0:
+                # اگر پوزیشن باز داریم، صبر می‌کنیم تا بسته شود
+                time.sleep(10)
+                continue
+
+            # اسکن بازار و فیلتر ارزهای پرنوسان و پرحجم
+            tickers = exchange.fetch_tickers()
+            candidates = []
+
+            for symbol, data in tickers.items():
+                if symbol == last_traded_symbol:
+                    continue
+                if '/USDT' in symbol:
+                    vol = data.get('quoteVolume', 0) or 0
+                    change = data.get('percentage', 0) or 0
+                    if vol > 50000:  # حجم بالای 50 هزار دلار
+                        candidates.append((symbol, change, vol))
+
+            # مرتب‌سازی بر اساس بیشترین نوسان
+            candidates.sort(key=lambda x: abs(x[1]), reverse=True)
+
+            if not candidates:
+                time.sleep(15)
+                continue
+
+            traded_successfully = False
+
+            # بررسی ارزها به نوبت (اگر یکی ارور داد یا نشد، می‌رود سراغ بعدی)
+            for symbol, change, vol in candidates[:15]:
+                try:
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=20)
+                    if len(ohlcv) < 15:
+                        continue
+
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['ema5'] = df['close'].ewm(span=5, adjust=False).mean()
+                    df['ema13'] = df['close'].ewm(span=13, adjust=False).mean()
+
+                    prev_ema5 = df['ema5'].iloc[-2]
+                    prev_ema13 = df['ema13'].iloc[-2]
+                    curr_ema5 = df['ema5'].iloc[-1]
+                    curr_ema13 = df['ema13'].iloc[-1]
+
+                    side = None
+                    if prev_ema5 <= prev_ema13 and curr_ema5 > curr_ema13:
+                        side = 'buy'   # لانگ
+                    elif prev_ema5 >= prev_ema13 and curr_ema5 < curr_ema13:
+                        side = 'sell'  # شورت
+
+                    if not side:
+                        continue
+
+                    # تنظیم لوریج
+                    try:
+                        exchange.set_leverage(LEVERAGE, symbol)
+                    except:
+                        pass
+
+                    # بررسی حداقل مقدار مجاز صرافی برای جلوگیری از خطای حجم
+                    market = exchange.market(symbol)
+                    min_cost = market.get('limits', {}).get('cost', {}).get('min', 1.0) or 1.0
+                    effective_cost = max(TARGET_MARGIN * LEVERAGE, min_cost)
+
+                    ticker = exchange.fetch_ticker(symbol)
+                    price = ticker['last']
+                    amount = effective_cost / price
+                    amount = exchange.amount_to_precision(symbol, amount)
+
+                    if float(amount) <= 0:
+                        continue
+
+                    # ارسال سفارش به صرافی
+                    if side == 'buy':
+                        order = exchange.create_market_buy_order(symbol, float(amount))
+                        send_telegram(f"🟢 پوزیشن LONG باز شد!\nارز: {symbol}\nقیمت: {price}\nحجم: {amount}")
+                    else:
+                        order = exchange.create_market_sell_order(symbol, float(amount))
+                        send_telegram(f"🔴 پوزیشن SHORT باز شد!\nارز: {symbol}\nقیمت: {price}\nحجم: {amount}")
+
+                    last_traded_symbol = symbol
+                    traded_successfully = True
+                    break  # پوزیشن باز شد، از حلقه ارزها خارج می‌شویم
+
+                except Exception as sub_e:
+                    # اگر این ارز نشد، بدون مشکل می‌رود ارز بعدی
+                    continue
+
+            if not traded_successfully:
+                time.sleep(20)
+
+        except Exception as e:
+            print(f"Loop error: {e}")
+            time.sleep(15)
+
 
 @app.route('/')
 def home():
-    return "Toobit Trading Bot is running 24/7!", 200
+    return "Toobit Trading Bot is running 24/7 with Telegram & Auto-Skip!"
 
-def check_data_connection():
-    try:
-        exchange.check_required_credentials()
-        markets = exchange.load_markets()
-        if markets:
-            print("✅ موفقیت: ارتباط با صرافی توبیت برقرار شد.")
-            return True
-        return False
-    except Exception as e:
-        print(f"❌ خطا در ارتباط با صرافی: {e}")
-        return False
-
-def analyze_market(symbol):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-
-        # محاسبه اندیکاتور EMA (میانگین متحرک نمایی)
-        df['ema_fast'] = df['close'].ewm(span=5, adjust=False).mean()
-        df['ema_slow'] = df['close'].ewm(span=13, adjust=False).mean()
-
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        gold_cross = (prev['ema_fast'] <= prev['ema_slow']) and (curr['ema_fast'] > curr['ema_slow'])
-        death_cross = (prev['ema_fast'] >= prev['ema_slow']) and (curr['ema_fast'] < curr['ema_slow'])
-
-        if gold_cross:
-            return 'LONG'
-        elif death_cross:
-            return 'SHORT'
-        elif curr['close'] > curr['ema_fast']:
-            return 'LONG'
-        else:
-            return 'SHORT'
-    except Exception as e:
-        print(f"⚠️ خطا در تحلیل ارز {symbol}: {e}")
-    return 'WAIT'
-
-def find_most_volatile_symbol():
-    try:
-        markets = exchange.load_markets()
-        tickers = exchange.fetch_tickers()
-        valid_symbols = {}
-
-        for symbol, ticker in tickers.items():
-            if symbol in markets and symbol not in blacklisted_symbols:
-                market_info = markets[symbol]
-                is_swap = market_info.get('swap', False) or market_info.get('type') == 'swap'
-                is_active = market_info.get('active', True)
-
-                if is_swap and is_active:
-                    change = ticker.get('percentage', 0)
-                    quote_volume = ticker.get('quoteVolume', 0)
-                    if change is not None and quote_volume > 50000:
-                        valid_symbols[symbol] = abs(change)
-
-        if not valid_symbols:
-            return None
-
-        sorted_symbols = sorted(valid_symbols, key=valid_symbols.get, reverse=True)
-
-        for symbol in sorted_symbols:
-            if symbol == last_trade['symbol']:
-                temp_signal = analyze_market(symbol)
-                if temp_signal == last_trade['side']:
-                    continue
-            return symbol
-
-        return sorted_symbols[0] if sorted_symbols else None
-    except Exception as e:
-        print(f"⚠️ خطا در اسکن بازار: {e}")
-        return None
-
-def manage_open_positions(current_price):
-    global positions, current_symbol
-    if not positions:
-        return
-
-    for pos in positions[:]:
-        side = pos['side']
-        entry_price = pos['entry_price']
-        open_time = pos['open_time']
-        margin = pos['margin']
-        elapsed_minutes = (time.time() - open_time) / 60
-
-        if side == 'LONG':
-            pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
-            gross_pnl_usd = margin * (((current_price - entry_price) / entry_price) * LEVERAGE)
-        else:
-            pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
-            gross_pnl_usd = margin * (((entry_price - current_price) / entry_price) * LEVERAGE)
-
-        total_position_size_usd = margin * LEVERAGE
-        total_fee = total_position_size_usd * FEE_RATE * 2
-        net_est_profit = gross_pnl_usd - total_fee
-
-        if net_est_profit < 0:
-            pos['has_been_in_loss'] = True
-
-        if pnl_pct >= 10.0 or pnl_pct <= -5.0:
-            close_specific_position(pos, current_price)
-            continue
-
-        if pos.get('has_been_in_loss', False) and net_est_profit >= MIN_NET_PROFIT:
-            close_specific_position(pos, current_price)
-            continue
-
-        if 7 <= elapsed_minutes <= 9 and net_est_profit < 0:
-            close_specific_position(pos, current_price)
-            continue
-
-def open_position(side, current_price, symbol):
-    global positions
-    try:
-        try:
-            exchange.set_leverage(LEVERAGE, symbol)
-        except Exception:
-            pass
-        
-        markets = exchange.load_markets()
-        market = markets.get(symbol, {})
-        limits = market.get('limits', {})
-        min_amount = limits.get('amount', {}).get('min', None)
-
-        notional_value_usd = MAX_MARGIN * LEVERAGE  
-        amount = notional_value_usd / current_price
-
-        if min_amount is not None and amount < min_amount:
-            return False
-
-        amount = float(exchange.amount_to_precision(symbol, amount))
-        order_side = 'buy' if side == 'LONG' else 'sell'
-        
-        print(f"🚀 [ثبت سفارش] ارز: {symbol} | جهت: {side} | حجم: {amount}")
-        order = exchange.create_market_order(symbol, order_side, amount)
-        actual_entry_price = order.get('average', current_price) or current_price
-
-        new_pos = {
-            'side': side,
-            'entry_price': actual_entry_price,
-            'open_time': time.time(),
-            'type': 'MAIN',
-            'has_been_in_loss': False,
-            'margin': MAX_MARGIN,
-            'amount': amount
-        }
-        positions.append(new_pos)
-        return True
-    except Exception as e:
-        print(f"❌ خطا در ثبت سفارش روی {symbol}: {e}")
-        return False
-
-def close_specific_position(pos, exit_price):
-    global positions, last_trade, current_symbol
-    entry_price = pos['entry_price']
-    side = pos['side']
-    margin = pos['margin']
-    amount = pos['amount']
-    symbol = current_symbol
-
-    try:
-        close_side = 'sell' if side == 'LONG' else 'buy'
-        exchange.create_market_order(symbol, close_side, amount, params={'reduceOnly': True})
-        print(f"🔒 پوزیشن بسته شد.")
-    except Exception as e:
-        print(f"⚠️ خطا در بستن پوزیشن: {e}")
-
-    last_trade['symbol'] = symbol
-    last_trade['side'] = side
-    positions.remove(pos)
-
-def bot_loop():
-    global current_symbol
-    if not check_data_connection():
-        print("⛔ خطا در اتصال صرافی.")
-        return
-
-    print("⚡ ربات خودکار تحلیل و معامله گر فعال شد...")
-    while True:
-        try:
-            if len(positions) == 0:
-                current_symbol = find_most_volatile_symbol()
-                if not current_symbol:
-                    time.sleep(10)
-                    continue
-
-                ticker = exchange.fetch_ticker(current_symbol)
-                current_price = ticker['last']
-
-                signal = analyze_market(current_symbol)
-                if signal in ['LONG', 'SHORT']:
-                    open_position(signal, current_price, current_symbol)
-                
-                time.sleep(2)
-            else:
-                ticker = exchange.fetch_ticker(current_symbol)
-                current_price = ticker['last']
-                manage_open_positions(current_price)
-
-            time.sleep(3)
-        except Exception as e:
-            print(f"⚠️ خطا در حلقه ربات: {e}")
-            time.sleep(5)
 
 if __name__ == '__main__':
-    threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000)
+    t = threading.Thread(target=run_bot_loop, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
