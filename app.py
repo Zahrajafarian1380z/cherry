@@ -14,9 +14,9 @@ SECRET_KEY = os.environ.get("TOOBIT_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# تنظیمات ترید
+# تنظیمات ترید (مارجین کاهش یافته به 0.3 دلار)
 LEVERAGE = 15
-TARGET_MARGIN = 0.5  # مارجین هدف (دلار)
+TARGET_MARGIN = 0.3  # مارجین هدف جدید (دلار)
 TAKE_PROFIT_PCT = 0.10  # 10% سود
 STOP_LOSS_PCT = 0.05   # 5% ضرر
 
@@ -50,7 +50,7 @@ def get_toobit_exchange():
 
 def run_bot_loop():
     time.sleep(10)  # صبر برای بالا آمدن کامل سرور
-    send_telegram("🚀 ربات تریدر توبیت استارت شد و در حال اتصال به صرافی است...")
+    send_telegram("🚀 <b>ربات تریدر توبیت استارت شد!</b>\nدر حال بررسی بازار و جستجوی فرصت مناسب...")
 
     exchange = get_toobit_exchange()
 
@@ -58,9 +58,9 @@ def run_bot_loop():
         exchange.load_markets()
         balance = exchange.fetch_balance()
         usdt_free = balance['free'].get('USDT', 0)
-        send_telegram(f"✅ اتصال به توبیت برقرار شد!\nموجودی آزاد حساب: {usdt_free} USDT")
+        send_telegram(f"✅ اتصال به صرافی برقرار شد.\n💰 موجودی آزاد حساب: <b>{usdt_free} USDT</b>")
     except Exception as e:
-        send_telegram(f"❌ خطا در اتصال به صرافی توبیت: {e}")
+        send_telegram(f"❌ <b>خطا در اتصال به صرافی توبیت:</b>\n{e}")
         return
 
     last_traded_symbol = None
@@ -73,7 +73,7 @@ def run_bot_loop():
 
             if len(active_positions) > 0:
                 # اگر پوزیشن باز داریم، صبر می‌کنیم تا بسته شود
-                time.sleep(10)
+                time.sleep(15)
                 continue
 
             # اسکن بازار و فیلتر ارزهای پرنوسان و پرحجم
@@ -93,12 +93,12 @@ def run_bot_loop():
             candidates.sort(key=lambda x: abs(x[1]), reverse=True)
 
             if not candidates:
-                time.sleep(15)
+                time.sleep(20)
                 continue
 
             traded_successfully = False
 
-            # بررسی ارزها به نوبت (اگر یکی ارور داد یا نشد، می‌رود سراغ بعدی)
+            # بررسی ارزها به نوبت
             for symbol, change, vol in candidates[:15]:
                 try:
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=20)
@@ -121,6 +121,7 @@ def run_bot_loop():
                         side = 'sell'  # شورت
 
                     if not side:
+                        # اگر سیگنالی نبود، هیچ معامله‌ای اجباری باز نمی‌شود و رد می‌شود
                         continue
 
                     # تنظیم لوریج
@@ -142,24 +143,36 @@ def run_bot_loop():
                     if float(amount) <= 0:
                         continue
 
-                    # ارسال سفارش به صرافی
+                    # ارسال سفارش به صرافی همراه با گزارش دقیق در تلگرام
                     if side == 'buy':
                         order = exchange.create_market_buy_order(symbol, float(amount))
-                        send_telegram(f"🟢 پوزیشن LONG باز شد!\nارز: {symbol}\nقیمت: {price}\nحجم: {amount}")
+                        send_telegram(
+                            f"🟢 <b>پوزیشن LONG (خرید) باز شد!</b>\n"
+                            f"📌 ارز: <b>{symbol}</b>\n"
+                            f"💲 قیمت ورود: <code>{price}</code>\n"
+                            f"📊 حجم مارجین: <b>{TARGET_MARGIN}$</b> (با لوریج {LEVERAGE}x)\n"
+                            f"📈 تغییرات حجم بازار: {vol:,.0f}$"
+                        )
                     else:
                         order = exchange.create_market_sell_order(symbol, float(amount))
-                        send_telegram(f"🔴 پوزیشن SHORT باز شد!\nارز: {symbol}\nقیمت: {price}\nحجم: {amount}")
+                        send_telegram(
+                            f"🔴 <b>پوزیشن SHORT (فروش) باز شد!</b>\n"
+                            f"📌 ارز: <b>{symbol}</b>\n"
+                            f"💲 قیمت ورود: <code>{price}</code>\n"
+                            f"📊 حجم مارجین: <b>{TARGET_MARGIN}$</b> (با لوریج {LEVERAGE}x)\n"
+                            f"📉 تغییرات حجم بازار: {vol:,.0f}$"
+                        )
 
                     last_traded_symbol = symbol
                     traded_successfully = True
                     break  # پوزیشن باز شد، از حلقه ارزها خارج می‌شویم
 
                 except Exception as sub_e:
-                    # اگر این ارز نشد، بدون مشکل می‌رود ارز بعدی
                     continue
 
             if not traded_successfully:
-                time.sleep(20)
+                # اگر در این چرخه فرصتی پیدا نشد، ربات منتظر می‌ماند و اجباری خرید نمی‌کند
+                time.sleep(30)
 
         except Exception as e:
             print(f"Loop error: {e}")
