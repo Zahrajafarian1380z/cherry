@@ -16,7 +16,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # تنظیمات اسکلپ
 LEVERAGE = 15
-TARGET_MARGIN = 0.3
+TARGET_MARGIN = 0.2
 TAKE_PROFIT_PCT = 0.008  # 0.8% حرکت قیمت
 STOP_LOSS_PCT = 0.004    # 0.4% حرکت قیمت
 
