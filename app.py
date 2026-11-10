@@ -14,7 +14,7 @@ SECRET_KEY = os.environ.get("TOOBIT_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# تنظیمات اسکلپ ۱ دقیقه‌ای
+# تنظیمات اسکلپ
 LEVERAGE = 15
 TARGET_MARGIN = 0.3  
 TAKE_PROFIT_PCT = 0.008  # 0.8% حرکت قیمت
@@ -45,23 +45,45 @@ def get_toobit_exchange():
     })
     return exchange
 
+def fetch_and_resample_candles(exchange, symbol):
+    """دریافت کندل‌های ۵ دقیقه و ساخت کندل‌های ۱۰ دقیقه"""
+    try:
+        ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=60)
+        if len(ohlcv_5m) < 30:
+            return None, None
+            
+        df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_5m['timestamp'] = pd.to_datetime(df_5m['timestamp'], unit='ms')
+        df_5m.set_index('timestamp', inplace=True)
+        
+        # ساخت دیتافریم ۱۰ دقیقه از روی ۵ دقیقه
+        df_10m = df_5m.resample('10min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna().reset_index()
+        
+        df_5m = df_5m.reset_index()
+        return df_5m, df_10m
+    except Exception as e:
+        print(f"Candle Fetch Error for {symbol}: {e}")
+        return None, None
+
 def calculate_fibonacci_levels(df):
-    """محاسبه سطوح فیبوناچی اصلاحی با خروجی پایدار چهار مقداره"""
+    """محاسبه سطوح فیبوناچی اصلاحی"""
     high = df['high'].max()
     low = df['low'].min()
     diff = high - low
-    
     if diff == 0:
         return None, None, high, low
         
-    # سطوح اصلاحی استاندارد از سقف به کف (برای لانگ / پولبک صعودی)
     long_levels = {
         '0.382': high - 0.382 * diff,
         '0.5': high - 0.5 * diff,
         '0.618': high - 0.618 * diff
     }
-    
-    # سطوح اصلاحی از کف به سقف (برای شورت / پولبک نزولی)
     short_levels = {
         '0.382': low + 0.382 * diff,
         '0.5': low + 0.5 * diff,
@@ -78,36 +100,9 @@ def calculate_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def analyze_higher_tf_shadows(exchange, symbol):
-    """بررسی شدوهای کندل ۱۵ دقیقه برای تایید ریجکت قیمت"""
-    try:
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=5)
-        if len(ohlcv_15m) < 3:
-            return None
-        
-        candle = ohlcv_15m[-2]
-        o, h, l, c = candle[1], candle[2], candle[3], candle[4]
-        
-        total_range = h - l
-        if total_range == 0:
-            return None
-            
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
-        
-        if lower_wick >= (total_range * 0.35):
-            return 'buy'
-        elif upper_wick >= (total_range * 0.35):
-            return 'sell'
-            
-    except Exception as e:
-        print(f"Shadow Analysis Error for {symbol}: {e}")
-        
-    return None
-
 def run_bot_loop():
     time.sleep(10)  
-    send_telegram("🚀 <b>ربات اسکالپ توبیت (نسخه دقیق با کندل‌های بسته شده) استارت شد!</b>")
+    send_telegram("🚀 <b>ربات اسکالپ (کندل‌های ۵ و ۱۰ دقیقه‌ای + استراتژی انعطاف‌پذیر) استارت شد!</b>")
     
     exchange = get_toobit_exchange()
     try:
@@ -152,48 +147,60 @@ def run_bot_loop():
             
             for symbol, change, vol in candidates[:15]:
                 try:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=40)
-                    if len(ohlcv) < 30:
+                    df_5m, df_10m = fetch_and_resample_candles(exchange, symbol)
+                    if df_5m is None or len(df_5m) < 20 or df_10m is None or len(df_10m) < 10:
                         continue
                         
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    # --- تحلیل تایم‌فریم ۵ دقیقه ---
+                    df_5m['ema5'] = df_5m['close'].ewm(span=5, adjust=False).mean()
+                    df_5m['ema13'] = df_5m['close'].ewm(span=13, adjust=False).mean()
+                    df_5m['rsi'] = calculate_rsi(df_5m['close'], period=14)
                     
-                    # محاسبه اندیکاتورها
-                    df['ema5'] = df['close'].ewm(span=5, adjust=False).mean()
-                    df['ema13'] = df['close'].ewm(span=13, adjust=False).mean()
-                    df['rsi'] = calculate_rsi(df['close'], period=14)
+                    c_close_5m = df_5m['close'].iloc[-2]
+                    c_rsi_5m = df_5m['rsi'].iloc[-2]
+                    ema5_5m = df_5m['ema5'].iloc[-2]
+                    ema13_5m = df_5m['ema13'].iloc[-2]
                     
-                    # بررسی روی کندل‌های قطعی و بسته‌شده (-2) برای جلوگیری از سیگنال‌های فیک لحظه‌ای
-                    prev_ema5 = df['ema5'].iloc[-3]
-                    prev_ema13 = df['ema13'].iloc[-3]
-                    curr_ema5 = df['ema5'].iloc[-2]
-                    curr_ema13 = df['ema13'].iloc[-2]
-                    curr_close = df['close'].iloc[-2]
-                    curr_rsi = df['rsi'].iloc[-2]
+                    long_fib_5m, short_fib_5m, _, _ = calculate_fibonacci_levels(df_5m)
                     
-                    long_fib, short_fib, _, _ = calculate_fibonacci_levels(df)
-                    if long_fib is None:
-                        continue
+                    # --- تحلیل تایم‌فریم ۱۰ دقیقه (بررسی شدوها و روند) ---
+                    c_10m = df_10m.iloc[-2]
+                    o_10m, h_10m, l_10m, cls_10m = c_10m['open'], c_10m['high'], c_10m['low'], c_10m['close']
+                    range_10m = h_10m - l_10m
+                    
+                    upper_wick_10m = (h_10m - max(o_10m, cls_10m)) / range_10m if range_10m > 0 else 0
+                    lower_wick_10m = (min(o_10m, cls_10m) - l_10m) / range_10m if range_10m > 0 else 0
                     
                     side = None
                     
-                    # شرایط خرید (Long): کراس صعودی در کندل بسته شده + قیمت در فیبو + RSI صعودی
-                    if prev_ema5 <= prev_ema13 and curr_ema5 > curr_ema13:
-                        if long_fib['0.618'] <= curr_close <= long_fib['0.382']:
-                            if curr_rsi > 48:
-                                side = 'buy'
-                                
-                    # شرایط فروش (Short): کراس نزولی در کندل بسته شده + قیمت در فیبو + RSI نزولی
-                    elif prev_ema5 >= prev_ema13 and curr_ema5 < curr_ema13:
-                        if short_fib['0.382'] <= curr_close <= short_fib['0.618']:
-                            if curr_rsi < 52:
-                                side = 'sell'
-                            
-                    # تاییدیه نهایی با شدوهای ۱۵ دقیقه
-                    if side:
-                        htf_signal = analyze_higher_tf_shadows(exchange, symbol)
-                        if htf_signal and htf_signal != side:
-                            side = None
+                    # ==========================================
+                    # سیستم OR (هرکدام از شرط‌های زیر برقرار شد)
+                    # ==========================================
+                    
+                    # شرط ۱: کراس صعودی EMA در ۵ دقیقه
+                    if ema5_5m > ema13_5m and df_5m['ema5'].iloc[-3] <= df_5m['ema13'].iloc[-3]:
+                        side = 'buy'
+                    # شرط ۲: کراس نزولی EMA در ۵ دقیقه
+                    elif ema5_5m < ema13_5m and df_5m['ema5'].iloc[-3] >= df_5m['ema13'].iloc[-3]:
+                        side = 'sell'
+                        
+                    # شرط ۳: برخورد قیمت با محدوده طلایی فیبوناچی در ۵ دقیقه
+                    elif long_fib_5m and long_fib_5m['0.618'] <= c_close_5m <= long_fib_5m['0.382']:
+                        side = 'buy'
+                    elif short_fib_5m and short_fib_5m['0.382'] <= c_close_5m <= short_fib_5m['0.618']:
+                        side = 'sell'
+                        
+                    # شرط ۴: شدوی بلند صعودی یا نزولی در کندل ۱۰ دقیقه (ریجکت قیمت)
+                    elif lower_wick_10m >= 0.35:
+                        side = 'buy'
+                    elif upper_wick_10m >= 0.35:
+                        side = 'sell'
+                        
+                    # شرط ۵: خروج RSI از محدوده‌های اشباع
+                    elif c_rsi_5m < 30:
+                        side = 'buy'
+                    elif c_rsi_5m > 70:
+                        side = 'sell'
 
                     if not side:
                         continue
@@ -207,7 +214,6 @@ def run_bot_loop():
                     min_cost = market.get('limits', {}).get('cost', {}).get('min', 1.0) or 1.0
                     effective_cost = max(TARGET_MARGIN * LEVERAGE, min_cost)
                     
-                    # قیمت لحظه‌ای برای ورود دقیق بازار
                     ticker = exchange.fetch_ticker(symbol)
                     price = ticker['last']
                     amount = effective_cost / price
@@ -216,7 +222,7 @@ def run_bot_loop():
                     if float(amount) <= 0:
                         continue
                         
-                    # ثبت سفارش بازار
+                    # ثبت سفارش خرید یا فروش
                     if side == 'buy':
                         order = exchange.create_market_buy_order(symbol, amount)
                         entry_price = float(order.get('average', price))
@@ -227,8 +233,7 @@ def run_bot_loop():
                             exchange.create_order(symbol, 'take_profit_market', 'sell', amount, None, {'stopPrice': tp_price, 'reduceOnly': True})
                             exchange.create_order(symbol, 'stop_market', 'sell', amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
                         except Exception as ex:
-                            print(f"Exchange TP/SL Order Error: {ex}")
-                            
+                            print(f"TP/SL Order Error: {ex}")
                     else:
                         order = exchange.create_market_sell_order(symbol, amount)
                         entry_price = float(order.get('average', price))
@@ -239,16 +244,14 @@ def run_bot_loop():
                             exchange.create_order(symbol, 'take_profit_market', 'buy', amount, None, {'stopPrice': tp_price, 'reduceOnly': True})
                             exchange.create_order(symbol, 'stop_market', 'buy', amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
                         except Exception as ex:
-                            print(f"Exchange TP/SL Order Error: {ex}")
+                            print(f"TP/SL Order Error: {ex}")
                         
                     send_telegram(
-                        f"🎯 <b>اسکلپ موفق (بدون سیگنال فیک)!</b>\n"
+                        f"🎯 <b>پوزیشن جدید (مبتنی بر شرایط انعطاف‌پذیر 5m و 10m)!</b>\n"
                         f" نماد: <b>{symbol}</b>\n"
                         f" جهت: <b>{'خرید (Long)' if side == 'buy' else 'فروش (Short)'}</b>\n"
                         f" قیمت ورود: <b>{entry_price}</b>\n"
-                        f" حد سود ثبت‌شده: {tp_price:.4f}\n"
-                        f" حد ضرر ثبت‌شده: {sl_price:.4f}\n"
-                        f" RSI کندل بسته شده: {curr_rsi:.1f}"
+                        f" حد سود: {tp_price:.4f} | حد ضرر: {sl_price:.4f}"
                     )
                     
                     last_traded_symbol = symbol
@@ -268,7 +271,7 @@ def run_bot_loop():
 
 @app.route('/')
 def home():
-    return "Stable Scalp Bot with Closed Candles is running!"
+    return "Flexible Multi-Timeframe Scalp Bot is running!"
 
 if __name__ == '__main__':
     t = threading.Thread(target=run_bot_loop)
