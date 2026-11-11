@@ -8,6 +8,11 @@ from flask import Flask
 
 app = Flask(__name__)
 
+# روتی برای پاسخ به پینگ‌های Render و جلوگیری از خطای پورت
+@app.route('/')
+def home():
+    return "Toobit Scalp Bot is Running Successfully! 🚀"
+
 # تنظیمات از متغیرهای محیطی Render
 API_KEY = os.environ.get("TOOBIT_API_KEY", "")
 SECRET_KEY = os.environ.get("TOOBIT_SECRET_KEY", "")
@@ -20,7 +25,7 @@ MAX_MARGIN = 0.3
 TAKE_PROFIT_PCT = 0.10 / LEVERAGE   # ۱۰٪ سود با اهرم
 STOP_LOSS_PCT   = 0.05 / LEVERAGE   # ۵٪ ضرر با اهرم
 
-# === استاپ جدید (درخواست تو) ===
+# استاپ جدید
 SOFT_STOP_PCT   = 0.12 / LEVERAGE   # ۱۲٪ → شروع مانیتورینگ (هنوز نبنده)
 RECOVERY_PCT    = 0.09 / LEVERAGE   # ۹٪ → بستن در قیمت بهتر
 FORCE_STOP_PCT  = 0.17 / LEVERAGE   # ۱۷٪ → بستن اجباری فوری
@@ -128,7 +133,6 @@ def calculate_rsi(series, period=14):
     return rsi
 
 def calculate_atr(df, period=14):
-    """محاسبه ATR ساده"""
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -233,20 +237,13 @@ def place_tp_sl_orders(exchange, symbol, side, amount, entry_price):
         return False, tp_price, sl_price
 
 def check_and_hard_stop(exchange, positions):
-    """
-    منطق جدید استاپ:
-    - وقتی به ۱۲٪ ضرر رسید → وارد حالت صبر می‌شه (نمی‌بنده)
-    - اگر برگشت به ۹٪ ضرر → با قیمت بهتر می‌بنده
-    - اگر بدون برگشت به ۱۷٪ رسید → فوری اجباری می‌بنده
-    """
     global positions_in_soft_stop
-
     current_symbols = set()
 
     for p in positions:
         try:
             symbol = p.get('symbol')
-            side = p.get('side', '').lower()          # 'long' یا 'short'
+            side = p.get('side', '').lower()
             contracts = float(p.get('contracts', 0) or 0)
             entry_price = float(p.get('entryPrice', 0) or 0)
             
@@ -254,81 +251,278 @@ def check_and_hard_stop(exchange, positions):
                 continue
 
             current_symbols.add(symbol)
-
-            # قیمت فعلی
             ticker = exchange.fetch_ticker(symbol)
             current_price = float(ticker['last'])
 
-            # محاسبه درصد حرکت قیمت
             if side in ['long', 'buy']:
                 price_change_pct = (current_price - entry_price) / entry_price
-            else:  # short
+            else:
                 price_change_pct = (entry_price - current_price) / entry_price
 
-            # ---------- حالت نرمال ----------
             if symbol not in positions_in_soft_stop:
                 if price_change_pct <= -SOFT_STOP_PCT:
-                    # رسید به ۱۲٪ → فقط وارد حالت صبر شو، هنوز نبند
                     positions_in_soft_stop[symbol] = True
-                    print(f"🟡 Soft Stop activated for {symbol} | change={price_change_pct*100:.3f}% → منتظر برگشت به ۹٪ یا فورس در ۱۷٪")
+                    print(f"🟡 Soft Stop activated for {symbol} | change={price_change_pct*100:.3f}%")
                     send_telegram(
                         f"🟡 <b>استاپ نرم ۱۲٪ فعال شد</b>\n"
                         f"نماد: <b>{symbol}</b>\n"
                         f"جهت: {side}\n"
                         f"ورود: {entry_price:.6f}\n"
                         f"قیمت فعلی: {current_price:.6f}\n"
-                        f"ضرر فعلی: <b>{abs(price_change_pct)*100:.2f}%</b>\n"
-                        f"⏳ صبر می‌کنم تا به ۹٪ برگرده (قیمت بهتر) یا اگر به ۱۷٪ رسید اجباری می‌بندم."
+                        f"ضرر فعلی: <b>{abs(price_change_pct)*100:.2f}%</b>"
                     )
                 continue
 
-            # ---------- حالت soft stop (قبلاً به ۱۲٪ رسیده) ----------
             if price_change_pct <= -FORCE_STOP_PCT:
-                # ۱۷٪ → فورس بستن
                 print(f"🚨 FORCE Stop (17%) triggered for {symbol} | change={price_change_pct*100:.3f}%")
                 close_side = 'sell' if side in ['long', 'buy'] else 'buy'
                 amount = exchange.amount_to_precision(symbol, contracts)
                 
-                exchange.create_order(
-                    symbol,
-                    'market',
-                    close_side,
-                    amount,
-                    None,
-                    {'reduceOnly': True}
-                )
-                
+                exchange.create_order(symbol, 'market', close_side, amount, None, {'reduceOnly': True})
                 send_telegram(
                     f"🛑 <b>فورس استاپ ۱۷٪ فعال شد</b>\n"
                     f"نماد: <b>{symbol}</b>\n"
-                    f"جهت: {side}\n"
-                    f"ورود: {entry_price:.6f}\n"
-                    f"قیمت فعلی: {current_price:.6f}\n"
-                    f"ضرر: <b>{abs(price_change_pct)*100:.2f}%</b>\n"
-                    f"پوزیشن به صورت اجباری بسته شد (بدون برگشت)."
+                    f"ضرر: <b>{abs(price_change_pct)*100:.2f}%</b>"
                 )
                 if symbol in positions_in_soft_stop:
                     del positions_in_soft_stop[symbol]
 
             elif price_change_pct >= -RECOVERY_PCT:
-                # برگشت به ۹٪ یا بهتر → بستن در قیمت بهتر
                 print(f"✅ Recovery close (9%) for {symbol} | change={price_change_pct*100:.3f}%")
                 close_side = 'sell' if side in ['long', 'buy'] else 'buy'
                 amount = exchange.amount_to_precision(symbol, contracts)
                 
-                exchange.create_order(
-                    symbol,
-                    'market',
-                    close_side,
-                    amount,
-                    None,
-                    {'reduceOnly': True}
-                )
-                
+                exchange.create_order(symbol, 'market', close_side, amount, None, {'reduceOnly': True})
                 send_telegram(
                     f"✅ <b>بستن با قیمت بهتر (۹٪)</b>\n"
-                    f"نماد: <b>{symbol}</b>\n"
-                    f"جهت: {side}\n"
-                    f"ورود: {entry_price:.6f}\n"
-                    f"قیمت فعلی: {current_price:.6f}\n"
-                    f"ضرر نهایی: 
+                    f"نماد: <b>{symbol}</b>"
+                )
+                if symbol in positions_in_soft_stop:
+                    del positions_in_soft_stop[symbol]
+
+        except Exception as e:
+            print(f"Error in hard stop check for position: {e}")
+
+    for sym in list(positions_in_soft_stop.keys()):
+        if sym not in current_symbols:
+            del positions_in_soft_stop[sym]
+
+def run_bot_loop():
+    global last_traded_symbol, last_trade_direction, last_trade_time, positions_in_soft_stop
+    time.sleep(10)
+    send_telegram(
+        "🚀 <b>ربات اسکالپ آپدیت شد</b>\n"
+        "• استاپ جدید: ۱۲٪ → صبر برای ۹٪ | فورس در ۱۷٪\n"
+        "• فقط ورود روی حرکت واقعی (Impulse) + فیلتر رنج"
+    )
+    
+    exchange = get_toobit_exchange()
+    try:
+        exchange.load_markets()
+        balance = exchange.fetch_balance()
+        usdt_free = balance['free'].get('USDT', 0)
+        send_telegram(f"✅ اتصال برقرار شد.\n💰 موجودی آزاد: <b>{usdt_free} USDT</b>")
+    except Exception as e:
+        send_telegram(f"❌ خطا در اتصال: {e}")
+        return
+        
+    last_status_report = 0
+    previous_active_count = 0
+
+    while True:
+        try:
+            positions = exchange.fetch_positions()
+            active_positions = [p for p in positions if float(p.get('contracts', 0) or 0) > 0]
+            current_active_count = len(active_positions)
+
+            if current_active_count > 0:
+                check_and_hard_stop(exchange, active_positions)
+                
+                if time.time() - last_status_report > 120:
+                    msg = "📊 <b>وضعیت فعلی پوزیشن‌ها:</b>\n"
+                    for p in active_positions:
+                        symbol = p.get('symbol', 'N/A')
+                        side = p.get('side', 'N/A')
+                        entry = float(p.get('entryPrice', 0) or 0)
+                        unrealized = float(p.get('unrealizedPnl', 0) or 0)
+                        soft_status = " | 🟡 در حالت صبر ۱۲٪" if symbol in positions_in_soft_stop else ""
+                        msg += f"• {symbol} | {side} | ورود: {entry:.4f} | سود/ضرر: <b>{unrealized:.4f}</b>{soft_status}\n"
+                    send_telegram(msg)
+                    last_status_report = time.time()
+
+                if previous_active_count > 0 and current_active_count < previous_active_count:
+                    send_telegram("🔔 <b>یک یا چند پوزیشن بسته شد.</b>\nدر حال اسکن مجدد کل بازار...")
+                    time.sleep(20)
+
+                previous_active_count = current_active_count
+                time.sleep(8)
+                continue
+
+            if previous_active_count > 0 and current_active_count == 0:
+                send_telegram("✅ همه پوزیشن‌ها بسته شدند. شروع اسکن کامل بازار...")
+                previous_active_count = 0
+                positions_in_soft_stop.clear()
+
+            if time.time() - last_trade_time < MIN_SECONDS_BETWEEN_TRADES:
+                time.sleep(10)
+                continue
+
+            tickers = exchange.fetch_tickers()
+            candidates = []
+            
+            for symbol, data in tickers.items():
+                if symbol == last_traded_symbol:
+                    continue
+                if '/USDT' in symbol:
+                    vol = data.get('quoteVolume', 0) or 0
+                    change = data.get('percentage', 0) or 0
+                    if vol > 50000:
+                        candidates.append((symbol, change, vol))
+                        
+            candidates.sort(key=lambda x: abs(x[1]), reverse=True)
+            
+            if not candidates:
+                time.sleep(25)
+                continue
+                
+            for symbol, change, vol in candidates[:15]:
+                try:
+                    df_5m, df_10m = fetch_and_resample_candles(exchange, symbol)
+                    if df_5m is None or len(df_5m) < 20 or df_10m is None or len(df_10m) < 10:
+                        continue
+
+                    atr_series = calculate_atr(df_5m, period=14)
+                    if atr_sys := (atr_series.dropna().shape[0] < 20):
+                        continue
+
+                    current_atr = atr_series.iloc[-2]
+                    avg_atr = atr_series.iloc[-15:-2].mean()
+
+                    if pd.isna(current_atr) or pd.isna(avg_atr) or current_atr < avg_atr * 1.15:
+                        continue
+
+                    lookback = 8
+                    recent_high = df_5m['high'].iloc[-lookback:].max()
+                    recent_low = df_5m['low'].iloc[-lookback:].min()
+                    recent_range = recent_high - recent_low
+                    if recent_range < current_atr * 1.8:
+                        continue
+
+                    vol_avg = df_5m['volume'].iloc[-20:-2].mean()
+                    current_vol = df_5m['volume'].iloc[-2]
+                    if current_vol < vol_avg * 1.3:
+                        continue
+
+                    prev_high = df_5m['high'].iloc[-3]
+                    prev_low = df_5m['low'].iloc[-3]
+                    c_close_5m = df_5m['close'].iloc[-2]
+                    
+                    df_5m['ema5'] = df_5m['close'].ewm(span=5, adjust=False).mean()
+                    df_5m['ema13'] = df_5m['close'].ewm(span=13, adjust=False).mean()
+                    df_5m['rsi'] = calculate_rsi(df_5m['close'], period=14)
+                    
+                    c_rsi_5m = df_5m['rsi'].iloc[-2]
+                    ema5_5m = df_5m['ema5'].iloc[-2]
+                    ema13_5m = df_5m['ema13'].iloc[-2]
+                    
+                    long_fib_5m, short_fib_5m, _, _ = calculate_fibonacci_levels(df_5m)
+                    
+                    c_10m = df_10m.iloc[-2]
+                    o_10m, h_10m, l_10m, cls_10m = c_10m['open'], c_10m['high'], c_10m['low'], c_10m['close']
+                    range_10m = h_10m - l_10m
+                    
+                    upper_wick_10m = (h_10m - max(o_10m, cls_10m)) / range_10m if range_10m > 0 else 0
+                    lower_wick_10m = (min(o_10m, cls_10m) - l_10m) / range_10m if range_10m > 0 else 0
+                    
+                    side = None
+                    
+                    if c_close_5m <= prev_low * 1.002:
+                        side = 'buy'
+                    elif c_close_5m >= prev_high * 0.998:
+                        side = 'sell'
+                    elif ema5_5m > ema13_5m and df_5m['ema5'].iloc[-3] <= df_5m['ema13'].iloc[-3]:
+                        side = 'buy'
+                    elif ema5_5m < ema13_5m and df_5m['ema5'].iloc[-3] >= df_5m['ema13'].iloc[-3]:
+                        side = 'sell'
+                    elif long_fib_5m and long_fib_5m['0.618'] <= c_close_5m <= long_fib_5m['0.382']:
+                        side = 'buy'
+                    elif short_fib_5m and short_fib_5m['0.382'] <= c_close_5m <= short_fib_5m['0.618']:
+                        side = 'sell'
+                    elif lower_wick_10m >= 0.35:
+                        side = 'buy'
+                    elif upper_wick_10m >= 0.35:
+                        side = 'sell'
+                    elif c_rsi_5m < 30:
+                        side = 'buy'
+                    elif c_rsi_5m > 70:
+                        side = 'sell'
+
+                    if not side:
+                        continue
+                        
+                    if symbol == last_traded_symbol and side == last_trade_direction:
+                        continue
+                        
+                    set_isolated_mode(exchange, symbol)
+                    try:
+                        exchange.set_leverage(LEVERAGE, symbol)
+                    except Exception as lev_err:
+                        print(f"set_leverage warning: {lev_err}")
+                        
+                    market = exchange.market(symbol)
+                    min_cost = market.get('limits', {}).get('cost', {}).get('min', 1.0) or 1.0
+                    effective_cost = max(MAX_MARGIN * LEVERAGE, min_cost)
+                    
+                    ticker = exchange.fetch_ticker(symbol)
+                    price = ticker['last']
+                    amount = effective_cost / price
+                    amount = exchange.amount_to_precision(symbol, amount)
+                    
+                    if float(amount) <= 0:
+                        continue
+                        
+                    if side == 'buy':
+                        order = exchange.create_market_buy_order(symbol, amount)
+                    else:
+                        order = exchange.create_market_sell_order(symbol, amount)
+
+                    entry_price = float(order.get('average') or order.get('price') or price)
+
+                    tp_sl_success, tp_price, sl_price = place_tp_sl_orders(
+                        exchange, symbol, side, amount, entry_price
+                    )
+
+                    if tp_sl_success:
+                        send_telegram(
+                            f"🎯 <b>پوزیشن جدید باز شد</b>\n"
+                            f"نماد: <b>{symbol}</b>\n"
+                            f"جهت: <b>{'خرید (Long)' if side == 'buy' else 'فروش (Short)'}</b>\n"
+                            f"ورود: {entry_price:.6f} | TP: {tp_price:.6f} | SL: {sl_price:.6f}"
+                        )
+                    else:
+                        send_telegram(
+                            f"⚠️ <b>پوزیشن باز شد اما TP/SL کامل ثبت نشد</b>\n"
+                            f"نماد: <b>{symbol}</b>"
+                        )
+                    
+                    last_traded_symbol = symbol
+                    last_trade_direction = side
+                    last_trade_time = time.time()
+                    previous_active_count = 1
+                    break
+                    
+                except Exception as ex:
+                    print(f"Error processing {symbol}: {ex}")
+                    continue
+
+        except Exception as loop_err:
+            print(f"Main loop error: {loop_err}")
+            time.sleep(15)
+
+if __name__ == '__main__':
+    t = threading.Thread(target=run_bot_loop)
+    t.daemon = True
+    t.start()
+    
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
