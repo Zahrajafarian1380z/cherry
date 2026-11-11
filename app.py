@@ -1,7 +1,7 @@
 import os
 import time
 import threading
-import requests
+import requests 
 import ccxt
 import pandas as pd
 from flask import Flask
