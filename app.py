@@ -53,12 +53,12 @@ def send_telegram(message):
         print(f"Telegram Error: {e}")
 
 def get_ohlcv(symbol, limit=50):
-    """دریافت کندل‌های قیمتی از بایننس (بدون نیاز به کلید صرافی)"""
+    """دریافت کندل‌های ۵ دقیقه‌ای از بایننس"""
     clean_symbol = symbol.replace('/', '').replace(':USDT', 'USDT').replace('.P', '')
     if not clean_symbol.endswith('USDT'):
         clean_symbol += 'USDT'
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={clean_symbol}&interval=1m&limit={limit}"
+        url = f"https://api.binance.com/api/v3/klines?symbol={clean_symbol}&interval=5m&limit={limit}"
         resp = requests.get(url, timeout=5).json()
         df = pd.DataFrame(resp, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'q_vol', 'trades', 't_buy_base', 't_buy_quote', 'ignore'])
         df['open'] = df['open'].astype(float)
@@ -95,15 +95,16 @@ def calculate_indicators(df):
 
 @app.route('/')
 def home():
-    return "Cyclo Trading Bot with Advanced Telegram Reporting is Running! 🚀"
+    return "Cyclo Trading Bot (TACUSDT - 5m Timeframe) is Running! 🚀"
 
 def evaluate_market_symbols():
-    """اسکن بازار بر اساس شرایط استراتژی"""
+    """اسکن ارز مشخص‌شده (TACUSDT) روی کندل‌های ۵ دقیقه‌ای"""
     global active_positions
     if len(active_positions) > 0:
         return
 
-    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'ADAUSDT', 'XRPUSDT', 'DOGEUSDT']
+    # اختصاصی روی ارز TAC
+    symbols = ['TACUSDT']
     
     for symbol in symbols:
         df = get_ohlcv(symbol, limit=40)
@@ -139,7 +140,7 @@ def open_paper_position(symbol, entry_price, stop_loss_level):
     active_positions.append(new_pos)
     
     send_telegram(
-        f"🚀 <b>پوزیشن خرید جدید باز شد</b>\n"
+        f"🚀 <b>پوزیشن خرید جدید باز شد (TACUSDT - ۵m)</b>\n"
         f"پلتفرم: <b>شبیه‌ساز (Paper Trading)</b>\n"
         f"نماد: <b>{symbol}</b> | اهرم: <b>{LEVERAGE}x</b>\n"
         f"قیمت ورود: <b>{entry_price:.4f}</b>\n"
@@ -209,11 +210,8 @@ def close_position(pos, exit_price, reason):
     entry_price = pos['entry_price']
     duration = round((time.time() - pos['open_time']) / 60, 1)
     pnl_pct = ((exit_price - entry_price) / entry_price) * 100 * LEVERAGE
-    
-    # محاسبه سود یا زیان دلاری بر اساس مارجین و اهرم
     pnl_usd = pos['margin'] * (pnl_pct / 100)
 
-    # آپدیت آمار ساعتی و روزانه
     hourly_stats['total_trades'] += 1
     daily_stats['total_trades'] += 1
     hourly_stats['net_pnl_usd'] += pnl_usd
@@ -229,7 +227,7 @@ def close_position(pos, exit_price, reason):
         emoji = "🔻"
 
     send_telegram(
-        f"{emoji} <b>گزارش اتمام معامله</b>\n"
+        f"{emoji} <b>گزارش اتمام معامله (TACUSDT - ۵m)</b>\n"
         f"نماد: <b>{pos['symbol']}</b>\n"
         f"دلیل خروج: <b>{reason}</b>\n"
         f"قیمت ورود: {entry_price:.4f} ➔ قیمت خروج: {exit_price:.4f}\n"
@@ -239,31 +237,28 @@ def close_position(pos, exit_price, reason):
     )
 
 def check_time_based_reports():
-    """بررسی و ارسال گزارش‌های سر ساعت و گزارش شبانه"""
+    """گزارش‌های ساعتی و شبانه"""
     global hourly_stats, daily_stats, last_hourly_report_hour, last_hourly_report_day
     
     now = datetime.datetime.now()
     current_hour = now.hour
     current_day = now.day
 
-    # ارسال گزارش سر ساعت
     if current_hour != last_hourly_report_hour:
         last_hourly_report_hour = current_hour
         msg = (
-            f"📊 <b>گزارش عملکرد ساعتی (ساعت {current_hour}:00)</b>\n"
+            f"📊 <b>گزارش عملکرد ساعتی TACUSDT (ساعت {current_hour}:00)</b>\n"
             f"• تعداد معاملات این ساعت: <b>{hourly_stats['total_trades']}</b>\n"
             f"• معاملات موفق: {hourly_stats['wins']} | ناموفق: {hourly_stats['losses']}\n"
             f"• مجموع سود/زیان خالص این ساعت: <b>${hourly_stats['net_pnl_usd']:+.2f}</b>"
         )
         send_telegram(msg)
-        # ریست کردن آمار ساعتی
         hourly_stats = {'total_trades': 0, 'wins': 0, 'losses': 0, 'net_pnl_usd': 0.0}
 
-    # ارسال گزارش آخر شب (ساعت ۲۳:۵۹ یا تغییر روز)
     if current_day != last_hourly_report_day and current_hour == 0:
         last_hourly_report_day = current_day
         msg = (
-            f"🌙 <b>گزارش پایانی و جمع‌بندی آخر شب</b>\n"
+            f"🌙 <b>گزارش پایانی و جمع‌بندی آخر شب TACUSDT</b>\n"
             f"📅 تاریخ: {(now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"• کل معاملات امروز: <b>{daily_stats['total_trades']}</b>\n"
@@ -273,17 +268,15 @@ def check_time_based_reports():
             f"<i>ربات برای روز جدید آماده است. 🚀</i>"
         )
         send_telegram(msg)
-        # ریست کردن آمار روزانه
         daily_stats = {'total_trades': 0, 'wins': 0, 'losses': 0, 'net_pnl_usd': 0.0}
 
 def background_loop():
-    # پیام اولیه که اعلام می‌کند ربات استارت شده است
     send_telegram(
-        "🟢 <b>ربات معاملاتی و مانیتورینگ استارت شد!</b>\n"
+        "🟢 <b>ربات معاملاتی TACUSDT استارت شد! (تایم‌فریم ۵ دقیقه)</b>\n"
         "• وضعیت اتصال: <b>برقرار و فعال</b>\n"
-        "• حالت: <b>شبیه‌ساز هوشمند (Paper Trading)</b>\n"
+        "• ارز زیر نظر: <b>TACUSDT</b>\n"
         "• استراتژی: <b>سیکلو (EMA + RSI + ATR + حجم)</b>\n"
-        "<i>آماده رصد بازار و ارسال گزارش معاملات...</i>"
+        "<i>آماده رصد چارت ۵ دقیقه‌ای و ارسال گزارش...</i>"
     )
 
     while True:
@@ -293,7 +286,7 @@ def background_loop():
             check_time_based_reports()
         except Exception as e:
             print(f"Background loop error: {e}")
-        time.sleep(15)
+        time.sleep(30)
 
 if __name__ == '__main__':
     t = threading.Thread(target=background_loop)
