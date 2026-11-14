@@ -1,9 +1,9 @@
 import os
 import time
+import datetime
 import threading
 import requests
 import pandas as pd
-import numpy as np
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -19,12 +19,25 @@ TAKE_PROFIT_PCT = 10.0       # ۱۰٪ سود با اهرم
 MAX_LOSS_PCT = 22.0          # حد ضرر نهایی (فورس استاپ)
 MAX_HOLD_MINUTES = 20        # حداکثر زمان باز ماندن پوزیشن
 
-# حافظه پوزیشن‌های فعال شبیه‌سازی‌شده
+# متغیرهای آماری برای گزارش‌گیری ساعتی و شبانه
 active_positions = []
-positions_in_soft_stop = {}
+hourly_stats = {
+    'total_trades': 0,
+    'wins': 0,
+    'losses': 0,
+    'net_pnl_usd': 0.0
+}
+daily_stats = {
+    'total_trades': 0,
+    'wins': 0,
+    'losses': 0,
+    'net_pnl_usd': 0.0
+}
+last_hourly_report_hour = datetime.datetime.now().hour
+last_daily_report_day = datetime.datetime.now().day
 
 def send_telegram(message):
-    """ارسال گزارش به تلگرام"""
+    """ارسال پیام به تلگرام"""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
         print(f"[Telegram Mock] {message}")
         return
@@ -40,7 +53,7 @@ def send_telegram(message):
         print(f"Telegram Error: {e}")
 
 def get_ohlcv(symbol, limit=50):
-    """دریافت کندل‌های قیمتی از صرافی بایننس (بدون نیاز به کلید صرافی)"""
+    """دریافت کندل‌های قیمتی از بایننس (بدون نیاز به کلید صرافی)"""
     clean_symbol = symbol.replace('/', '').replace(':USDT', 'USDT').replace('.P', '')
     if not clean_symbol.endswith('USDT'):
         clean_symbol += 'USDT'
@@ -58,24 +71,20 @@ def get_ohlcv(symbol, limit=50):
         print(f"Error fetching OHLCV for {symbol}: {e}")
         return None
 
-# --- محاسبات تکنیکال دقیقاً مطابق پاین اسکریپت شما ---
 def calculate_indicators(df):
-    # EMA 9 و EMA 21
+    """محاسبه اندیکاتورهای استراتژی سیکلو (EMA, RSI, حجم، ATR)"""
     df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
     
-    # RSI 14
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # Volume SMA 20
     df['vol_ma'] = df['volume'].rolling(window=20).mean()
     df['is_volume_high'] = df['volume'] > df['vol_ma']
     
-    # ATR 14
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -86,17 +95,14 @@ def calculate_indicators(df):
 
 @app.route('/')
 def home():
-    return "Cyclo Strategy Python Bot is Running Successfully! 🚀"
+    return "Cyclo Trading Bot with Advanced Telegram Reporting is Running! 🚀"
 
 def evaluate_market_symbols():
-    """بررسی دوره‌ای بازار بر اساس قوانین دقیق پاین اسکریپت"""
+    """اسکن بازار بر اساس شرایط استراتژی"""
     global active_positions
-    
-    # اگر از قبل پوزیشن بازی داریم، سیگنال جدید بررسی نمی‌شود تا پوزیشن بسته شود
     if len(active_positions) > 0:
         return
 
-    # لیست ارزهای زیر نظر برای اسکن
     symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'ADAUSDT', 'XRPUSDT', 'DOGEUSDT']
     
     for symbol in symbols:
@@ -105,25 +111,16 @@ def evaluate_market_symbols():
             continue
             
         df = calculate_indicators(df)
-        
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # شرایط ورود (Buy Condition) دقیقاً مشابه پاین اسکریپت
-        # ta.crossover(emaFast, emaSlow) and isVolumeHigh and (rsiValue > 45)
         crossover = (prev['ema_fast'] <= prev['ema_slow']) and (curr['ema_fast'] > curr['ema_slow'])
         is_volume_high = curr['volume'] > curr['vol_ma']
         rsi_valid = curr['rsi'] > 45
         
-        buy_condition = crossover and is_volume_high and rsi_valid
-        
-        if buy_condition:
+        if crossover and is_volume_high and rsi_valid:
             entry_price = curr['close']
-            current_atr = curr['atr']
-            
-            # محاسبه حد ضرر ATR (stopLossLevel = close - (currentAtr * 2.0))
-            stop_loss_level = entry_price - (current_atr * 2.0)
-            
+            stop_loss_level = entry_price - (curr['atr'] * 2.0)
             open_paper_position(symbol, entry_price, stop_loss_level)
             break
 
@@ -142,16 +139,16 @@ def open_paper_position(symbol, entry_price, stop_loss_level):
     active_positions.append(new_pos)
     
     send_telegram(
-        f"🎯 <b>سیگنال خرید (استراتژی سیکلو) صادر شد</b>\n"
-        f"نماد: <b>{symbol}</b> (اهرم {LEVERAGE}x)\n"
-        f"قیمت ورود: {entry_price:.4f}\n"
+        f"🚀 <b>پوزیشن خرید جدید باز شد</b>\n"
+        f"پلتفرم: <b>شبیه‌ساز (Paper Trading)</b>\n"
+        f"نماد: <b>{symbol}</b> | اهرم: <b>{LEVERAGE}x</b>\n"
+        f"قیمت ورود: <b>{entry_price:.4f}</b>\n"
         f"حد ضرر ATR: {stop_loss_level:.4f}"
     )
 
 def monitor_positions():
-    """مدیریت پوزیشن‌های باز، بررسی حد ضرر ATR، خروج‌ها و سود/زیان"""
-    global active_positions, positions_in_soft_stop
-    
+    """مدیریت پوزیشن‌های باز و بررسی سود، زیان و شرایط خروج"""
+    global active_positions, hourly_stats, daily_stats
     if not active_positions:
         return
 
@@ -172,7 +169,6 @@ def monitor_positions():
         current_price = curr['close']
         rsi_value = curr['rsi']
         
-        # محاسبه سود/زیان درصدی با اهرم ۱۵
         pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
         
         if pnl_pct > pos['max_pnl_seen']:
@@ -180,19 +176,15 @@ def monitor_positions():
         if pnl_pct < 0:
             pos['has_been_in_loss'] = True
 
-        # بررسی شرایط خروج (Sell Condition) مشابه پاین اسکریپت:
-        # sellCondition = ta.crossunder(emaFast, emaSlow) or (close < stopLossLevel) or (rsiValue < 40)
         crossunder = (prev['ema_fast'] >= prev['ema_slow']) and (curr['ema_fast'] < curr['ema_slow'])
         hit_atr_sl = current_price < stop_loss_level
         rsi_exit = rsi_value < 40
 
-        # ۱. خروج بر اساس شرایط تکنیکال استراتژی (تقاطع نزولی یا RSI < 40 یا برخورد به SL)
         if crossunder or hit_atr_sl or rsi_exit:
             reason = "برخورد به حد ضرر ATR 🛑" if hit_atr_sl else ("تقاطع نزولی EMA 📉" if crossunder else "افت RSI زیر ۴۰ 🔻")
             close_position(pos, current_price, reason)
             continue
 
-        # ۲. حد سود ایده‌آل (۱۰٪) یا فورس استاپ نهایی (۲۲٪)
         if pnl_pct >= TAKE_PROFIT_PCT:
             close_position(pos, current_price, "هدف سود ۱۰ درصدی محقق شد 🎯")
             continue
@@ -201,18 +193,16 @@ def monitor_positions():
             close_position(pos, current_price, f"حد ضرر نهایی ({MAX_LOSS_PCT}%) 🛑")
             continue
 
-        # ۳. بازار راکد و خروج با سود جزئی بعد از ۵ دقیقه
         if elapsed_minutes >= 5 and pnl_pct >= 0.01 and pos['max_pnl_seen'] < 2.0:
             close_position(pos, current_price, "بازار راکد - ذخیره سود جزئی 🟢")
             continue
 
-        # ۴. سقف زمانی ۲۰ دقیقه‌ای
         if elapsed_minutes >= MAX_HOLD_MINUTES:
             close_position(pos, current_price, "پایان زمان مجاز ۲۰ دقیقه‌ای ⏰")
             continue
 
 def close_position(pos, exit_price, reason):
-    global active_positions
+    global active_positions, hourly_stats, daily_stats
     if pos in active_positions:
         active_positions.remove(pos)
         
@@ -220,21 +210,87 @@ def close_position(pos, exit_price, reason):
     duration = round((time.time() - pos['open_time']) / 60, 1)
     pnl_pct = ((exit_price - entry_price) / entry_price) * 100 * LEVERAGE
     
-    emoji = "✅" if pnl_pct >= 0 else "🔻"
+    # محاسبه سود یا زیان دلاری بر اساس مارجین و اهرم
+    pnl_usd = pos['margin'] * (pnl_pct / 100)
+
+    # آپدیت آمار ساعتی و روزانه
+    hourly_stats['total_trades'] += 1
+    daily_stats['total_trades'] += 1
+    hourly_stats['net_pnl_usd'] += pnl_usd
+    daily_stats['net_pnl_usd'] += pnl_usd
+    
+    if pnl_pct >= 0:
+        hourly_stats['wins'] += 1
+        daily_stats['wins'] += 1
+        emoji = "✅"
+    else:
+        hourly_stats['losses'] += 1
+        daily_stats['losses'] += 1
+        emoji = "🔻"
+
     send_telegram(
-        f"{emoji} <b>پوزیشن بسته شد</b>\n"
-        f"دلیل: <b>{reason}</b>\n"
+        f"{emoji} <b>گزارش اتمام معامله</b>\n"
         f"نماد: <b>{pos['symbol']}</b>\n"
-        f"ورود: {entry_price:.4f} ➔ خروج: {exit_price:.4f}\n"
+        f"دلیل خروج: <b>{reason}</b>\n"
+        f"قیمت ورود: {entry_price:.4f} ➔ قیمت خروج: {exit_price:.4f}\n"
         f"مدت معامله: {duration} دقیقه\n"
-        f"نتیجه نهایی (اهرم {LEVERAGE}x): <b>{pnl_pct:+.2f}%</b>"
+        f"سود/زیان درصدی (اهرم {LEVERAGE}x): <b>{pnl_pct:+.2f}%</b>\n"
+        f"مبلغ سود/زیان دلاری: <b>${pnl_usd:+.2f}</b>"
     )
 
+def check_time_based_reports():
+    """بررسی و ارسال گزارش‌های سر ساعت و گزارش شبانه"""
+    global hourly_stats, daily_stats, last_hourly_report_hour, last_hourly_report_day
+    
+    now = datetime.datetime.now()
+    current_hour = now.hour
+    current_day = now.day
+
+    # ارسال گزارش سر ساعت
+    if current_hour != last_hourly_report_hour:
+        last_hourly_report_hour = current_hour
+        msg = (
+            f"📊 <b>گزارش عملکرد ساعتی (ساعت {current_hour}:00)</b>\n"
+            f"• تعداد معاملات این ساعت: <b>{hourly_stats['total_trades']}</b>\n"
+            f"• معاملات موفق: {hourly_stats['wins']} | ناموفق: {hourly_stats['losses']}\n"
+            f"• مجموع سود/زیان خالص این ساعت: <b>${hourly_stats['net_pnl_usd']:+.2f}</b>"
+        )
+        send_telegram(msg)
+        # ریست کردن آمار ساعتی
+        hourly_stats = {'total_trades': 0, 'wins': 0, 'losses': 0, 'net_pnl_usd': 0.0}
+
+    # ارسال گزارش آخر شب (ساعت ۲۳:۵۹ یا تغییر روز)
+    if current_day != last_hourly_report_day and current_hour == 0:
+        last_hourly_report_day = current_day
+        msg = (
+            f"🌙 <b>گزارش پایانی و جمع‌بندی آخر شب</b>\n"
+            f"📅 تاریخ: {(now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"• کل معاملات امروز: <b>{daily_stats['total_trades']}</b>\n"
+            f"• مجموع برنده: {daily_stats['wins']} | مجموع بازنده: {daily_stats['losses']}\n"
+            f"• 💰 <b>سود/زیان کل امروز: ${daily_stats['net_pnl_usd']:+.2f}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>ربات برای روز جدید آماده است. 🚀</i>"
+        )
+        send_telegram(msg)
+        # ریست کردن آمار روزانه
+        daily_stats = {'total_trades': 0, 'wins': 0, 'losses': 0, 'net_pnl_usd': 0.0}
+
 def background_loop():
+    # پیام اولیه که اعلام می‌کند ربات استارت شده است
+    send_telegram(
+        "🟢 <b>ربات معاملاتی و مانیتورینگ استارت شد!</b>\n"
+        "• وضعیت اتصال: <b>برقرار و فعال</b>\n"
+        "• حالت: <b>شبیه‌ساز هوشمند (Paper Trading)</b>\n"
+        "• استراتژی: <b>سیکلو (EMA + RSI + ATR + حجم)</b>\n"
+        "<i>آماده رصد بازار و ارسال گزارش معاملات...</i>"
+    )
+
     while True:
         try:
             evaluate_market_symbols()
             monitor_positions()
+            check_time_based_reports()
         except Exception as e:
             print(f"Background loop error: {e}")
         time.sleep(15)
